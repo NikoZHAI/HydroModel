@@ -11,8 +11,11 @@ import pandas as pd
 from time import time
 
 from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import BaseCrossValidator, TimeSeriesSplit, GridSearchCV, KFold, learning_curve
+from sklearn.model_selection import (BaseCrossValidator, TimeSeriesSplit, 
+                        GridSearchCV, KFold, learning_curve, train_test_split)
 from sklearn.preprocessing import MaxAbsScaler, Normalizer, MinMaxScaler
+from sklearn.utils.validation import indexable
+from sklearn.utils.metaestimators import _safe_split
 
 from .hydro_helpers.scoring import render_score
 from .hydro_helpers.plotting import plot_res
@@ -48,6 +51,7 @@ class BaseHydroModel(object):
     def __init__(self):
         self._LOCAL_SCOPE_NAME = 'BaseHydroModel'
         self.X, self.y, self.X_test, self.y_test = None, None, None, None
+        self.cv_split_method = KFold(n_splits=3)
 
     def load_data(self, path=None, loaded_data=None,
         with_prepro=False, _format='excel', with_time=False,
@@ -198,7 +202,7 @@ class BaseHydroModel(object):
         else:
             return set2.iloc[:,:-1], set2.iloc[:,-1], set1.iloc[:,:-1], set1.iloc[:,-1]
 
-    def scale_input(self, method='maxabs', min=-1.0, max=1.0,
+    def scale_input(self, method='minmax', min=0.0, max=1.0,
         write_to_model=True, loaded_X_test=None, loaded_X=None):
         """ Scale Input
 
@@ -230,12 +234,8 @@ class BaseHydroModel(object):
         """
         decisioner = decisioner or self.cv_decisioner # Decisioning scorer in Hyperparameter selection (GridSearchCV)
         model = loaded_model or self._model
-        if split_method == 'time_series': 
-            cv_split_method = TimeSeriesSplit(n_splits=n_splits)
-        elif split_method == 'kfold':
-            cv_split_method = KFold(n_splits=n_splits)
-        else:
-            cv_split_method = split_method(n_splits=n_splits, **kwargs)
+
+        cv_split_method = self.set_cv_split_method(split_method, n_splits)
 
         if method == 'grid':
             cv = GridSearchCV
@@ -244,8 +244,6 @@ class BaseHydroModel(object):
 
         param_grid = param_grid or self.param_grid
         cv_scorings = cv_scorings or self.cv_scorings
-
-        self.cv_split_method = cv_split_method
 
         return cv(model, 
                   param_grid=param_grid,
@@ -309,19 +307,52 @@ class BaseHydroModel(object):
         print(".xls/.xlsx --- MS-Excel format. Only data in sheet No.1 are read.\n")
         print("The data file is desired to have two columns, precipitation and discharge. No gap should present.\n")
 
-    def _render_splits(self, method=None, data_to_split=None):
-        method = method or self.cv_split_method or 'undifined'
-        data = data_to_split if type(data_to_split).__name__ != 'NoneType' else self.X
-        if type(data).__name__ == 'NoneType':
+    def render_splits(self, cv_split_method=None, n_splits=None, X=None, y=None):
+        method = cv_split_method or self.cv_split_method
+        if (X is None and self.X is None) or (y is None and self.y is None):
             raise ValueError("No dataset provided for the split...")
-        if isinstance(method, BaseCrossValidator):
-            splits = method.split(data)
-        else:
-            raise ValueError("method should be a sklearn.model_selection spliter class...")
-        
-        for train, cv in splits:
-            print("TRAIN:", len(train), "CV:", len(cv))
-            X_tr, X_cv = self.X[train], self.X[cv]
-            y_tr, y_cv = self.y[train], self.y[cv]
+        if X is None: X = self.X 
+        if y is None: y = self.y
 
-        return X_tr, y_tr, X_cv, y_cv
+        if n_splits != None and isinstance(method,
+            BaseCrossValidator.__class__):
+            cv_split_method.n_splits = n_splits
+
+        return self._gen_train_val(X, y, method)
+
+    def _gen_train_val(self, X, y, cv_split_method):
+        X, y, groups = indexable(X, y, None)
+        Xs_tr, ys_tr, Xs_cv, ys_cv = [], [], [], []
+
+        if isinstance(cv_split_method, BaseCrossValidator):
+            for tr, cv in cv_split_method.split(X, y, groups):
+                X_tr, y_tr = _safe_split(self, X, y, tr)
+                X_cv, y_cv = _safe_split(self, X, y, cv, tr)
+                Xs_tr.append(X_tr)
+                Xs_cv.append(X_cv)
+                ys_tr.append(y_tr)
+                ys_cv.append(y_cv)
+        elif cv_split_method.__name__ == 'train_test_split':
+                X, X_val, y, y_val = train_test_split(
+                    X, y, random_state=self._random_state,
+                    test_size=self.validation_fraction)
+                Xs_tr.append(X_tr)
+                Xs_cv.append(X_cv)
+                ys_tr.append(y_tr)
+                ys_cv.append(y_cv)
+        else:
+            raise ValueError("Split method should be a "
+                "sklearn.model_selection spliter class...")
+
+        return Xs_tr, ys_tr, Xs_cv, ys_cv
+
+    def set_cv_split_method(self, split_method='kfold', n_splits=3, shuffle=False):
+        if split_method == 'time_series': 
+            cv_split_method = TimeSeriesSplit(n_splits=n_splits)
+        elif split_method == 'kfold':
+            cv_split_method = KFold(n_splits=n_splits)
+        else:
+            cv_split_method = split_method(n_splits=n_splits, **kwargs)
+
+        self.cv_split_method = cv_split_method
+        return cv_split_method

@@ -22,6 +22,7 @@ def _plot_res_matplotlib(y_target, y_hat, title=None):
     ax.set(xlabel='Time (hours)', ylabel='Discharge (m³/s)',
            title=title)
     ax.grid()
+    plt.legend()
 
     # fig.savefig("res.png")
     plt.show()
@@ -59,31 +60,47 @@ def _plot_res_bokeh(y_target, y_hat, title=None, env='jupyter'):
 
 def plot_err(err_tr, err_cv, title=None,
              xlim=(None, None), ylim=(None, None),
+             xscale='linear', yscale='linear',
              env='jupyter', engine='matplotlib'):
     if engine=='matplotlib':
-        _plot_err_matplotlib(err_tr, err_cv, title=title, xlim=xlim, ylim=ylim)
+        _plot_err_matplotlib(err_tr, err_cv, title=title,
+            xlim=xlim, ylim=ylim, xscale=xscale, yscale=yscale)
     elif engine=='bokeh':
-        _plot_err_bokeh(err_tr, err_cv, title=title, env=env, xlim=xlim, ylim=ylim)
+        _plot_err_bokeh(err_tr, err_cv, title=title,
+            env=env, xlim=xlim, ylim=ylim,
+            xscale=xscale, yscale=yscale)
     else:
         raise ValueError("Unknown engine: '%s'..."%engine)
+
+    axe_scales = ['linear', 'log', 'symlog', 'logit']
+
+    if (xscale not in axe_scales
+        or yscale not in axe_scales):
+        raise ValueError("Unknown Axis Scale Type: X: '%s' and Y: '%s' ..."
+            % xscale, yscale)
+
     return None
 
 def _plot_err_matplotlib(err_tr, err_cv, title=None,
-             xlim=(None, None), ylim=(None, None)):
+             xlim=(None, None), ylim=(None, None),
+             xscale='linear', yscale='linear'):
     import matplotlib
     import matplotlib.pyplot as plt
     # Note that using plt.subplots below is equivalent to using
     # fig = plt.figure() and then ax = fig.add_subplot(111)
+
     fig, ax = plt.subplots(figsize=(8,6), dpi=100)
-    ax.plot(range(len(err_tr)), err_tr, label='Training Loss')
-    ax.plot(range(len(err_cv)), err_cv, 
-        label='Cross-validation MSE', c='orangered')
+    ax.plot(range(len(err_tr)), err_tr,
+        linewidth=2.0, label='Training Loss')
+    ax.plot(range(len(err_cv)), err_cv, linewidth=2.0,
+        label='Cross-validation Loss', c='orangered')
     plt.xlim(xlim[0], xlim[1])
     plt.ylim(ylim[0], ylim[1])
 
-    ax.set(xlabel='Iteration [N]', ylabel='Loss',
-           title=title)
-    ax.grid()
+    ax.set(xlabel='Iteration [N]', ylabel='Loss', title=title)
+    ax.set_yscale(yscale)
+    ax.grid(which='both')
+    plt.legend()
 
     # fig.savefig("res.png")
     plt.show()

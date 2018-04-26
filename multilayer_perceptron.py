@@ -18,7 +18,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.base import is_classifier
 from sklearn.neural_network._base import ACTIVATIONS, DERIVATIVES, LOSS_FUNCTIONS
 from sklearn.neural_network._stochastic_optimizers import SGDOptimizer, AdamOptimizer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, BaseCrossValidator
 from sklearn.externals import six
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.utils import gen_batches, check_random_state
@@ -1342,6 +1342,7 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
                      validation_fraction=validation_fraction,
                      beta_1=beta_1, beta_2=beta_2, epsilon=epsilon)
 
+        BaseHydroModel.__init__(self)
         BaseHydroModel.shift_RE = shift_RE
         BaseHydroModel.shift_Q = shift_Q
         BaseHydroModel.steps_predict = steps_predict
@@ -1353,8 +1354,6 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
         BaseHydroModel.input_data_validated = False
         BaseHydroModel.data_ivs_done = False
 
-        # The model is the estimator itself
-        self._model = self
 
     def _initialize(self, y, layer_units):
         # set all attributes, allocate weights etc for first call
@@ -1387,14 +1386,13 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
             self.intercepts_.append(intercept_init)
 
         #if self.solver in _STOCHASTIC_SOLVERS:
-        self.loss_curve_ = []
-        self.loss_curve_val_ = []
-        self._no_improvement_count = 0
-        if self.early_stopping:
-            self.validation_scores_ = []
-            self.best_validation_score_ = -np.inf
-        else:
-            self.best_loss_ = np.inf
+        self._reinit_fit_stochastic()
+        self.loss_curves_ = []
+        self.loss_curves_val_ = []
+        self.score_curves_ = []
+        self.score_curves_val_ = []
+
+        return None
 
     def predict(self, X):
         """Predict using the multi-layer perceptron model.
@@ -1591,16 +1589,14 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
         loss, coef_grads, intercept_grads = self._backprop(
             X, y, activations, deltas, coef_grads, intercept_grads)
         grad = _pack(coef_grads, intercept_grads)
-
-        if self.early_stopping:
-            self.loss_curve_.append(loss)
-            loss_val = _mse(y_val, self._predict(X_val))
-            self.loss_curve_val_.append(loss_val)
+        self._gen_loss_score_curves(self.early_stopping, X, y, X_val, y_val)
         
-        return loss+loss_val, grad
+        return loss, grad
 
     def _fit_stochastic(self, X, y, X_val, y_val, activations, deltas,
                         coef_grads, intercept_grads, layer_units, incremental):
+
+        early_stopping = self.early_stopping and not incremental
 
         if not incremental or not hasattr(self, '_optimizer'):
             params = self.coefs_ + self.intercepts_
@@ -1640,9 +1636,10 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
 
                 self.n_iter_ += 1
                 self.loss_ = accumulated_loss / X.shape[0]
-
+                self._gen_loss_score_curves(self.early_stopping,
+                    X, y, X_val, y_val)
                 self.t_ += n_samples
-                self.loss_curve_.append(self.loss_)
+
                 if self.verbose:
                     print("Iteration %d, loss = %.8f" % (self.n_iter_,
                                                          self.loss_))
@@ -1687,6 +1684,8 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
             self.coefs_ = self._best_coefs
             self.intercepts_ = self._best_intercepts
 
+        return None
+
     def _fit(self, X, y, incremental=False):
         # check random state
         self._random_state = check_random_state(self.random_state)
@@ -1705,7 +1704,9 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
 
         X, y = self._validate_input(X, y, incremental)
         early_stopping = self.early_stopping and not incremental
-        if early_stopping:
+        if early_stopping and self.solver in _STOCHASTIC_SOLVERS:
+            pass
+        elif early_stopping:
             X, X_val, y, y_val = train_test_split(
                 X, y, random_state=self._random_state,
                 test_size=self.validation_fraction)
@@ -1752,8 +1753,13 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
         intercept_grads = [np.empty(n_fan_out_) for n_fan_out_ in
                            layer_units[1:]]
 
-        # Run the Stochastic optimization solver
-        if self.solver in _STOCHASTIC_SOLVERS:
+        # Run the Stochastic optimization solver with cross-validation
+        if self.solver in _STOCHASTIC_SOLVERS and early_stopping:
+            self._fit_stochastic_with_cv(X, y, activations, deltas, coef_grads,
+                                 intercept_grads, layer_units, incremental)
+
+        # Run the Stochastic optimization solver without cross-validation
+        elif self.solver in _STOCHASTIC_SOLVERS:
             self._fit_stochastic(X, y, X_val, y_val, activations, deltas, coef_grads,
                                  intercept_grads, layer_units, incremental)
 
@@ -1762,3 +1768,112 @@ class HydroMLP(BaseMultilayerPerceptron, BaseHydroModel, RegressorMixin):
             self._fit_lbfgs(X, y, X_val, y_val, activations, deltas, coef_grads,
                             intercept_grads, layer_units)
         return self
+
+    def _update_no_improvement_count(self, early_stopping, X_val, y_val):
+        if early_stopping:
+            # compute validation score, use that for stopping
+            self.score_curve_val_.append(self.score(X_val, y_val))
+
+            if self.verbose:
+                print("Validation score: %f" % self.score_curve_val_[-1])
+            # update best parameters
+            # use validation_scores_, not loss_curve_
+            # let's hope no-one overloads .score with mse
+            last_valid_score = self.score_curve_val_[-1]
+
+            if last_valid_score < (self.best_validation_score_ +
+                                   self.tol):
+                self._no_improvement_count += 1
+            else:
+                self._no_improvement_count = 0
+
+            if last_valid_score > self.best_validation_score_:
+                self.best_validation_score_ = last_valid_score
+                self._best_coefs = [c.copy() for c in self.coefs_]
+                self._best_intercepts = [i.copy()
+                                         for i in self.intercepts_]
+        else:
+            if self.loss_curve_[-1] > self.best_loss_ - self.tol:
+                self._no_improvement_count += 1
+            else:
+                self._no_improvement_count = 0
+            if self.loss_curve_[-1] < self.best_loss_:
+                self.best_loss_ = self.loss_curve_[-1]
+
+    def _update_no_improvement_count_with_loss(self, early_stopping, X_val, y_val):
+        if early_stopping:
+            # compute validation score, use that for stopping
+            loss_val = _mse(y_val, self._predict(X_val))/2.0
+            self.loss_curve_val_.append(loss_val)
+
+            if self.verbose:
+                print("Validation score: %f" % self.loss_curve_val_[-1])
+            # update best parameters
+            # use validation_scores_, not loss_curve_
+            # let's hope no-one overloads .score with mse
+            last_valid_loss = self.loss_curve_val_[-1]
+
+            if last_valid_loss > (self.best_validation_loss_ +
+                                   self.tol):
+                self._no_improvement_count += 1
+            else:
+                self._no_improvement_count = 0
+
+            if last_valid_loss < self.best_validation_loss_:
+                self.best_validation_loss_ = last_valid_loss
+                self._best_coefs = [c.copy() for c in self.coefs_]
+                self._best_intercepts = [i.copy()
+                                         for i in self.intercepts_]
+        else:
+            if self.loss_curve_[-1] > self.best_loss_ - self.tol:
+                self._no_improvement_count += 1
+            else:
+                self._no_improvement_count = 0
+            if self.loss_curve_[-1] < self.best_loss_:
+                self.best_loss_ = self.loss_curve_[-1]
+
+    def _gen_loss_score_curves(self, early_stopping, X, y, X_val, y_val):
+        # Loss curve stochastic optimization
+        self.loss_curve_.append(self.loss_)
+        self.score_curve_.append(self.score(X, y))
+        
+        if early_stopping:
+            loss_val = _mse(y_val, self._predict(X_val))/2.0
+            self.loss_curve_val_.append(loss_val)
+
+        return None
+
+    def _fit_stochastic_with_cv(self, X, y, activations, deltas, coef_grads,
+                                intercept_grads, layer_units, incremental):
+        # Generate sequences of training and validation sets
+        Xs, ys, Xs_val, ys_val = self.render_splits(
+            cv_split_method=self.cv_split_method, X=X, y=y)
+        n_val = 0
+        for X, y, X_val, y_val in zip(Xs, ys, Xs_val, ys_val):
+            self._reinit_fit_stochastic()
+            self._fit_stochastic(X, y, X_val, y_val, activations, deltas, coef_grads,
+                                 intercept_grads, layer_units, incremental)
+            self._save_curves()
+            n_val += 1
+        
+        return None
+
+    def _reinit_fit_stochastic(self):
+        self.loss_curve_ = []
+        self.loss_curve_val_ = []
+        self.score_curve_ = []
+        self.score_curve_val_ = []
+        self._no_improvement_count = 0
+        if self.early_stopping:
+            self.best_validation_score_ = -np.inf
+            self.best_validation_loss_ = np.inf
+        else:
+            self.best_loss_ = np.inf
+        return None
+
+    def _save_curves(self):
+        self.loss_curves_.append(self.loss_curve_)
+        self.loss_curves_val_.append(self.loss_curve_val_)
+        self.score_curves_.append(self.score_curves_)
+        self.score_curves_val_.append(self.score_curve_val_)
+        return None

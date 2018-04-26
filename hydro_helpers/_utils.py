@@ -81,7 +81,7 @@ def _mse(y, y_pred):
     if erro.any() < 0:
         return(np.nan)
     f = np.nanmean(erro)
-    return f/2.0
+    return f
 
 def _kge(q_rec, q_sim):
     '''
